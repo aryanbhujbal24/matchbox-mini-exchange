@@ -1,0 +1,24 @@
+// Protobuf equivalents of the NewOrder and Ack wire messages, used only by
+// bench_wire to compare encodings and transports. The exchange itself
+// speaks the fixed-width binary protocol in include/mx/protocol.hpp.
+syntax = "proto3";
+package mxpb;
+
+message NewOrder {
+  uint64 cl_ord_id = 1;
+  sint64 price     = 2;
+  uint32 qty       = 3;
+  uint32 side      = 4;
+  uint32 tif       = 5;
+  uint32 ord_type  = 6;
+}
+
+message Ack {
+  uint64 cl_ord_id = 1;
+  uint64 order_id  = 2;
+}
+
+service OrderEntry {
+  rpc Submit(NewOrder) returns (Ack);                 // one RPC per order
+  rpc Stream(stream NewOrder) returns (stream Ack);   // one long-lived stream
+}

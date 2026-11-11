@@ -1,0 +1,36 @@
+loaded 269748 events, 10 levels, 23399.9 s of market time, in 0.40 s
+
+Replay without the market maker
+  events replayed            269747 in 0.04 s (6.74 M events/s, including the per-event book check)
+  best bid+ask match file    100.000% of events
+  all 10 levels match file   100.000% of events (100.000% of individual levels)
+  visible executions         8974 (613248 shares); 91.75% hit the order our price-time priority picks
+  hidden executions          2444 (197506 shares), not applied to the book
+  levels adopted from file   5965 added on entering the window, 6796 rebuilt
+  re-numbered orders matched 708 by level; quantity never found 0 events; crossed on arrival 0; off-tick skipped 0
+
+Market maker: 100 shares per quote, inventory cap 10 lots, re-quote every 1.0 s
+PnL in dollars, marked to the mid, no fees. edge and markouts in cents per share.
+spread  gamma       PnL$   sd30m$   endInv   avg|q|   max|q|  fills   shares   edge   mo1s  mo10s  mo60s
+6       0          -6880      641      743      612     1049   2978   153967   2.55  -1.35  -2.49  -3.07
+6       0.02       -5653      643       40      515     1049   3245   169172   2.41  -1.42  -2.64  -3.15
+6       0.05       -5364      649       36      445     1049   3416   177482   2.30  -1.47  -2.73  -3.37
+6       0.1        -5826      588      -70      336     1034   3530   184066   2.07  -1.62  -2.86  -3.56
+6       0.3        -6667      316      -59      199     1039   3466   183977   1.65  -1.94  -3.09  -3.43
+10      0          -3489      666     1031      638     1041   1876    92667   3.87  -0.42  -1.87  -2.21
+10      0.02       -3032      653      553      535     1046   2149   106933   3.71  -0.55  -2.07  -2.69
+10      0.05       -3694      577      363      425     1043   2377   120981   3.48  -0.73  -2.23  -2.95
+10      0.1        -4000      471      142      294     1021   2681   136498   3.17  -0.93  -2.42  -3.04
+10      0.3        -4957      292      -34      184     1017   2934   152440   2.37  -1.47  -2.76  -3.05
+14      0          -1506      719      997      679     1048   1114    48991   4.84   0.23  -1.39  -2.16
+14      0.02       -1985      602      729      558     1048   1373    63201   4.75   0.13  -1.75  -2.56
+14      0.05       -2428      525      439      396     1046   1626    80529   4.40  -0.04  -1.92  -2.92
+14      0.1        -2637      361      298      269     1017   1950    95460   3.89  -0.52  -2.19  -2.88
+14      0.3        -3781      249      -16      169      949   2544   131894   2.84  -1.16  -2.53  -2.62
+20      0           -220      555      861      477     1028    530    23433   5.79   0.26  -1.99  -2.43
+20      0.02         -13      602      297      463     1036    767    32389   5.77   0.54  -1.72  -2.23
+20      0.05        -713      529      158      435     1020   1000    43276   5.28   0.11  -1.92  -3.01
+20      0.1        -1527      348      216      289     1045   1289    58718   4.72  -0.12  -2.12  -3.19
+20      0.3        -2859      236      120      151      708   2118   105438   3.40  -0.84  -2.25  -2.55
+
+wrote out/replay_sweep.csv and replay_path_*.csv

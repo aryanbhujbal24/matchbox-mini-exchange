@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mini-exchange, a recorded run</title>
+<style>
+  :root { --paper:#EEF2F5; --ink:#13233A; --muted:#5C6B7A; --line:#B9C4CF; --bid:#0B8A74; --ask:#C4442B; --maker:#D99A00; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--paper); color:var(--ink);
+         font-family: Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif; }
+  main { max-width:1240px; margin:0 auto; padding:20px; }
+  canvas { display:block; width:100%; height:auto; aspect-ratio:1200/675; border:1px solid var(--line); background:var(--paper); }
+  .controls { display:flex; align-items:center; gap:14px; margin-top:12px; flex-wrap:wrap;
+              font-family: Inter, "Helvetica Neue", Arial, sans-serif; font-size:14px; }
+  button, select { font:inherit; color:var(--ink); background:#FAFCFD; border:1px solid var(--ink); padding:7px 14px; cursor:pointer; }
+  button { min-width:84px; font-weight:600; }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline:3px solid var(--maker); outline-offset:2px; }
+  input[type=range] { flex:1; min-width:180px; accent-color:var(--ink); }
+  #clock { font-variant-numeric:tabular-nums; min-width:96px; text-align:right; }
+  .notes { max-width:70ch; font-size:17px; line-height:1.55; margin-top:22px; }
+  .notes h1 { font-size:26px; margin:0 0 8px; }
+  .key { display:flex; gap:22px; flex-wrap:wrap; font-family: Inter, "Helvetica Neue", Arial, sans-serif; font-size:14px; margin:14px 0 0; padding:0; list-style:none; }
+  .key i { display:inline-block; width:12px; height:12px; margin-right:7px; vertical-align:-1px; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="stage" width="1200" height="675" role="img"
+    aria-label="Animated diagram of the exchange. Orders travel from four kinds of participant through the gateway into the matching engine, whose order book is drawn in the centre. Trades and book changes leave on the market data feed. A chart underneath shows price, the market maker's quotes and its trades."></canvas>
+  <div class="controls">
+    <button id="play" type="button">Pause</button>
+    <label>Speed
+      <select id="speed">
+        <option value="0.25">0.25x</option><option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option><option value="2">2x</option><option value="4">4x</option>
+      </select>
+    </label>
+    <input id="scrub" type="range" min="0" max="1000" value="0" aria-label="Position in the recording">
+    <span id="clock">0.0 s</span>
+  </div>
+  <section class="notes">
+    <h1>What you are watching</h1>
+    <p>This is a recording of the real programs, not a mock-up. The exchange, the market maker and three
+       simulated groups of traders ran as separate processes talking over TCP and UDP. The exchange logged
+       every order, fill and trade with a timestamp, and this page plays that log back.</p>
+    <p>Each moving dot is one message. Orders travel left to right into the matching engine; fills travel
+       back to whoever traded. Every order is written to the journal before it is matched. Trades and book
+       changes leave on the market data feed.</p>
+    <ul class="key">
+      <li><i style="background:var(--bid)"></i>Buy orders and bids</li>
+      <li><i style="background:var(--ask)"></i>Sell orders and asks</li>
+      <li><i style="background:var(--maker)"></i>The market maker's quotes and fills</li>
+    </ul>
+  </section>
+</main>
+<script src="recording.js"></script>
+<script>
+(function () {
+  "use strict";
+  const R = window.RECORDING;
+  const W = 1200, H = 675;
+  const cv = document.getElementById("stage");
+  const ctx = cv.getContext("2d");
+  const C = { paper:"#EEF2F5", grid:"#E1E7EC", panel:"#FAFCFD", line:"#B9C4CF", ink:"#13233A", muted:"#5C6B7A",
+              wire:"#9AA8B5", bid:"#0B8A74", ask:"#C4442B", maker:"#D99A00", makerSoft:"rgba(217,154,0,0.16)" };
+  const SERIF = 'Charter, "Bitstream Charter", "Iowan Old Style", Georgia, serif';
+  const SANS = 'Inter, "Helvetica Neue", Arial, sans-serif';
+
+  function fit() {
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    cv.width = W * dpr; cv.height = H * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  fit();
+  window.addEventListener("resize", () => { fit(); draw(now); });
+
+  // ---------------------------------------------------------------- data
+  const EV = R.ev, Q = R.q, V = R.v, DUR = R.duration;
+  // index of the last row with time <= t (-1 if none); rows are time-sorted, time at column `col`
+  function upto(rows, t, col) {
+    let lo = 0, hi = rows.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (rows[m][col] <= t) lo = m + 1; else hi = m; }
+    return lo - 1;
+  }
+  // a slowly moving centre price for the ladder, so the book scrolls instead of jumping
+  const centre = new Array(Q.length);
+  { let c = Q[0][1];
+    for (let i = 0; i < Q.length; i++) {
+      const dt = i ? Q[i][0] - Q[i - 1][0] : 0;
+      c += (Q[i][1] - c) * (1 - Math.exp(-dt / 1500));
+      centre[i] = c;
+    } }
+
+  // ---------------------------------------------------------------- book state (replayed from the log)
+  let cursor = 0, orders = new Map(), pending = {}, counts, lastT = -1;
+  function resetState() {
+    cursor = 0; orders = new Map(); pending = {};
+    counts = { cmds: 0, trades: 0, volume: 0, md: 0, by: { 1: 0, 2: 0, 3: 0, 4: 0 } };
+  }
+  resetState();
+  function advance(t) {
+    if (t < lastT) resetState();
+    lastT = t;
+    for (; cursor < EV.length && EV[cursor][1] <= t; cursor++) {
+      const e = EV[cursor];
+      switch (e[0]) {
+        case 0: pending[e[2]] = e; counts.cmds++; counts.by[e[2]]++; break;                       // new order
+        case 1: { const n = pending[e[2]];                                                          // ack
+                  if (n) orders.set(e[3], { c: e[2], side: n[3], px: n[4], qty: n[5], rests: n[6] === 0 && n[7] === 0 });
+                  if (n && n[6] === 0 && n[7] === 0) counts.md++;
+                  break; }
+        case 2: counts.cmds++; counts.by[e[2]]++; break;                                            // cancel request
+        case 3: { const o = orders.get(e[3]); if (o) { o.qty = e[6]; if (e[6] === 0) orders.delete(e[3]); } break; }  // fill
+        case 4: { const o = orders.get(e[3]);                                                       // cancelled
+                  if (o) { if (e[5] === 2) o.qty -= e[4]; else orders.delete(e[3]); }
+                  if (e[5] !== 1) counts.md++;
+                  break; }
+        case 5: counts.trades++; counts.volume += e[3]; counts.md += 2; break;                      // trade
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- geometry
+  const CL = [ { id: 1, name: "Market maker",       note: "quotes both sides",   y: 112 },
+               { id: 2, name: "Liquidity provider", note: "wide, slow quotes",   y: 184 },
+               { id: 3, name: "Noise traders",      note: "random orders",       y: 256 },
+               { id: 4, name: "Informed traders",   note: "hit stale quotes",    y: 328 } ];
+  const CX = 26, CW = 190, CH = 50;
+  const GW = { x: 286, y: 150, w: 118, h: 140 };
+  const EN = { x: 500, y: 76, w: 352, h: 350 };
+  const JR = { x: 286, y: 334, w: 118, h: 66 };
+  const FD = { x: 940, y: 96, w: 234, h: 78 };
+  const LS = [ { y: 232, name: "Maker's copy of the book" }, { y: 304, name: "Feed listener" } ];
+  const ROW = 14, LADDER_Y = 132, LADDER_H = 280, MIDX = EN.x + EN.w / 2;
+
+  const bez = (a, b, u) => {  // horizontal-tangent curve from a to b
+    const k = (b[0] - a[0]) * 0.5, x1 = a[0] + k, x2 = b[0] - k, v = 1 - u;
+    return [ v*v*v*a[0] + 3*v*v*u*x1 + 3*v*u*u*x2 + u*u*u*b[0], v*v*v*a[1] + 3*v*v*u*a[1] + 3*v*u*u*b[1] + u*u*u*b[1] ];
+  };
+  const lin = (a, b, u) => [ a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u ];
+  const cOut = i => [CX + CW, CL[i].y], gIn = i => [GW.x, 196 + i * 16];
+  const gOutA = [GW.x + GW.w, 205], eInA = [EN.x, 205], eOutB = [EN.x, 241], gInB = [GW.x + GW.w, 241];
+  const eJ = [EN.x, 367], jIn = [JR.x + JR.w, 367];
+  const eF = [EN.x + EN.w, 135], fIn = [FD.x, 135], busX = FD.x + FD.w / 2;
+  const ease = u => u * u * (3 - 2 * u);
+
+  // ---------------------------------------------------------------- drawing helpers
+  function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+  function box(b, r) { rr(b.x, b.y, b.w, b.h, r || 3); ctx.fillStyle = C.panel; ctx.fill(); ctx.strokeStyle = C.ink; ctx.lineWidth = 1.2; ctx.stroke(); }
+  function txt(s, x, y, font, color, align) { ctx.font = font; ctx.fillStyle = color; ctx.textAlign = align || "left"; ctx.textBaseline = "alphabetic"; ctx.fillText(s, x, y); }
+  function wire(fn, dashed) {
+    ctx.beginPath();
+    for (let i = 0; i <= 24; i++) { const p = fn(i / 24); if (i) ctx.lineTo(p[0], p[1]); else ctx.moveTo(p[0], p[1]); }
+    ctx.strokeStyle = C.wire; ctx.lineWidth = 1.2; ctx.setLineDash(dashed ? [3, 4] : []); ctx.stroke(); ctx.setLineDash([]);
+  }
+  function dot(p, r, fill, stroke) {
+    ctx.beginPath(); ctx.arc(p[0], p[1], r, 0, 6.2832);
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = 1.5; ctx.stroke(); }
+  }
+  function diamond(p, r, fill) {
+    ctx.beginPath(); ctx.moveTo(p[0], p[1] - r); ctx.lineTo(p[0] + r, p[1]); ctx.lineTo(p[0], p[1] + r); ctx.lineTo(p[0] - r, p[1]); ctx.closePath();
+    ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = C.ink; ctx.lineWidth = 1; ctx.stroke();
+  }
+  const fmt = n => n.toLocaleString("en-US");
+
+  // ---------------------------------------------------------------- scene
+  function drawPaper() {
+    ctx.fillStyle = C.paper; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath();
+    for (let x = 0.5; x < W; x += 24) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+    for (let y = 0.5; y < H; y += 24) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+    ctx.stroke();
+  }
+
+  function drawStatic(t) {
+    txt("mini-exchange", 26, 40, "700 25px " + SERIF, C.ink);
+    txt("a recorded run of the real system, replayed", 196, 40, "italic 15px " + SERIF, C.muted);
+    txt((t / 1000).toFixed(1) + " s", W - 26, 40, "600 17px " + SANS, C.ink, "right");
+
+    // wires
+    CL.forEach((c, i) => wire(u => bez(cOut(i), gIn(i), u)));
+    wire(u => lin(gOutA, eInA, u)); wire(u => lin(eOutB, gInB, u));
+    wire(u => lin(eJ, jIn, u), true);
+    wire(u => lin(eF, fIn, u));
+    wire(u => lin([busX, FD.y + FD.h], [busX, LS[1].y], u));
+
+    // participants
+    CL.forEach(c => {
+      rr(CX, c.y - CH / 2, CW, CH, 3); ctx.fillStyle = C.panel; ctx.fill();
+      ctx.strokeStyle = C.ink; ctx.lineWidth = 1.2; ctx.stroke();
+      if (c.id === 1) { ctx.fillStyle = C.maker; ctx.fillRect(CX, c.y - CH / 2, 6, CH); }
+      txt(c.name, CX + 16, c.y - 4, "700 15px " + SERIF, C.ink);
+      txt(c.note, CX + 16, c.y + 14, "12px " + SANS, C.muted);
+      txt(fmt(counts.by[c.id]) + " sent", CX + CW - 9, c.y + 14, "600 12px " + SANS, C.ink, "right");
+    });
+
+    // gateway
+    box(GW);
+    txt("Gateway", GW.x + 12, GW.y + 24, "700 16px " + SERIF, C.ink);
+    txt("TCP sessions", GW.x + 12, GW.y + 108, "12px " + SANS, C.muted);
+    txt("epoll, binary protocol", GW.x + 12, GW.y + 124, "12px " + SANS, C.muted);
+    txt("lock-free", (gOutA[0] + eInA[0]) / 2, 180, "11px " + SANS, C.muted, "center");
+    txt("queues", (gOutA[0] + eInA[0]) / 2, 193, "11px " + SANS, C.muted, "center");
+    for (let i = 0; i < 6; i++) {  // ring-buffer slots on the two queues
+      ctx.strokeStyle = C.wire; ctx.lineWidth = 1; ctx.fillStyle = C.paper;
+      ctx.fillRect(414 + i * 13, 201, 9, 8); ctx.strokeRect(414.5 + i * 13, 201.5, 9, 8);
+      ctx.fillRect(414 + i * 13, 237, 9, 8); ctx.strokeRect(414.5 + i * 13, 237.5, 9, 8);
+    }
+
+    // journal
+    box(JR);
+    txt("Journal", JR.x + 12, JR.y + 22, "700 16px " + SERIF, C.ink);
+    txt(fmt(counts.cmds * 32) + " bytes", JR.x + 12, JR.y + 40, "600 12px " + SANS, C.ink);
+    txt("written before", (eJ[0] + jIn[0]) / 2, 384, "11px " + SANS, C.muted, "center");
+    txt("matching", (eJ[0] + jIn[0]) / 2, 397, "11px " + SANS, C.muted, "center");
+
+    // market data
+    box(FD);
+    txt("Market data feed", FD.x + 12, FD.y + 24, "700 16px " + SERIF, C.ink);
+    txt("UDP multicast, numbered messages", FD.x + 12, FD.y + 44, "12px " + SANS, C.muted);
+    txt(fmt(counts.md) + " sent", FD.x + 12, FD.y + 64, "600 12px " + SANS, C.ink);
+    LS.forEach(l => {
+      rr(FD.x + 20, l.y, FD.w - 40, 40, 3); ctx.fillStyle = C.panel; ctx.fill(); ctx.strokeStyle = C.ink; ctx.lineWidth = 1.2; ctx.stroke();
+      txt(l.name, busX, l.y + 25, "14px " + SERIF, C.ink, "center");
+    });
+  }
+
+  function drawEngine(t) {
+    box(EN);
+    txt("Matching engine", EN.x + 14, EN.y + 25, "700 17px " + SERIF, C.ink);
+    txt("price-time priority", EN.x + EN.w - 14, EN.y + 25, "12px " + SANS, C.muted, "right");
+    txt("bids, quantity resting", EN.x + 14, EN.y + 46, "600 12px " + SANS, C.bid);
+    txt("asks", EN.x + EN.w - 14, EN.y + 46, "600 12px " + SANS, C.ask, "right");
+    txt("price", MIDX, EN.y + 46, "12px " + SANS, C.muted, "center");
+
+    const qi = upto(Q, t, 0);
+    const c = qi < 0 ? Q[0][1] : centre[qi];
+    // aggregate resting orders into levels, split into the maker's quantity and everyone else's
+    const lv = new Map();
+    orders.forEach(o => {
+      if (!o.rests || o.qty <= 0) return;
+      const k = o.px * 2 + o.side;
+      let l = lv.get(k); if (!l) { l = { px: o.px, side: o.side, mm: 0, other: 0 }; lv.set(k, l); }
+      if (o.c === 1) l.mm += o.qty; else l.other += o.qty;
+    });
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(EN.x + 1, LADDER_Y, EN.w - 2, LADDER_H); ctx.clip();
+    const yOf = px => LADDER_Y + LADDER_H / 2 + (c - px) * ROW;
+    const top = Math.ceil(c + LADDER_H / 2 / ROW) + 1, bot = Math.floor(c - LADDER_H / 2 / ROW) - 1;
+    ctx.fillStyle = "rgba(19,35,58,0.045)";
+    for (let px = bot; px <= top; px++) if (px % 2 === 0) ctx.fillRect(EN.x + 1, yOf(px) - ROW / 2, EN.w - 2, ROW);
+    for (let px = bot; px <= top; px++) {
+      if (px % 2 === 0 || lv.has(px * 2) || lv.has(px * 2 + 1))
+        txt(String(px), MIDX, yOf(px) + 4, "11px " + SANS, C.muted, "center");
+    }
+    const HALF = 150, GAP = 24, SCALE = 2.0;  // 2 px per unit, same scale for everyone
+    lv.forEach(l => {
+      const y = yOf(l.px) - ROW / 2 + 1.5, h = ROW - 3;
+      const wm = Math.min(HALF, l.mm * SCALE), wo = Math.min(HALF - wm, l.other * SCALE);
+      const col = l.side === 0 ? C.bid : C.ask, dir = l.side === 0 ? -1 : 1, x0 = MIDX + dir * GAP;
+      // the maker's quantity is drawn nearest the price column so it reads first
+      let x = x0;
+      if (wm > 0) { ctx.fillStyle = C.maker; ctx.fillRect(dir < 0 ? x - wm : x, y, wm, h); x += dir * (wm + 2); }
+      if (wo > 0) { ctx.fillStyle = col; ctx.fillRect(dir < 0 ? x - wo : x, y, wo, h); x += dir * wo; }
+      txt(String(l.mm + l.other), x + dir * 5, yOf(l.px) + 4, "600 10px " + SANS, C.ink, dir < 0 ? "right" : "left");
+    });
+    // trades: a ring on the price row, fading
+    for (let i = upto(EV, t, 1); i >= 0 && EV[i][1] > t - 600; i--) {
+      const e = EV[i]; if (e[0] !== 5) continue;
+      const a = (t - e[1]) / 600, y = yOf(e[2]);
+      ctx.globalAlpha = 0.28 * (1 - a);
+      ctx.fillStyle = e[4] === 0 ? C.bid : C.ask; ctx.fillRect(EN.x + 1, y - ROW / 2, EN.w - 2, ROW);
+      ctx.globalAlpha = 1 - a;
+      dot([MIDX, y], 10 + a * 14, null, e[4] === 0 ? C.bid : C.ask);
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+    // edges fade so rows scroll in and out softly
+    const g1 = ctx.createLinearGradient(0, LADDER_Y, 0, LADDER_Y + 22); g1.addColorStop(0, C.panel); g1.addColorStop(1, "rgba(250,252,253,0)");
+    ctx.fillStyle = g1; ctx.fillRect(EN.x + 1, LADDER_Y, EN.w - 2, 22);
+    const g2 = ctx.createLinearGradient(0, LADDER_Y + LADDER_H - 22, 0, LADDER_Y + LADDER_H); g2.addColorStop(0, "rgba(250,252,253,0)"); g2.addColorStop(1, C.panel);
+    ctx.fillStyle = g2; ctx.fillRect(EN.x + 1, LADDER_Y + LADDER_H - 22, EN.w - 2, 22);
+  }
+
+  // one particle per logged message; its position depends only on (t - event time)
+  function drawParticles(t) {
+    const first = upto(EV, t - 520, 1) + 1;
+    for (let i = first; i < EV.length && EV[i][1] <= t + 340; i++) {
+      const e = EV[i], dt = t - e[1], k = e[0];
+      if (k === 0 || k === 2) {                       // order or cancel request: participant -> gateway -> engine
+        const ci = e[2] - 1, isNew = k === 0;
+        const col = !isNew ? null : (e[2] === 1 ? C.maker : (e[3] === 0 ? C.bid : C.ask));
+        let p = null;
+        if (dt >= -330 && dt < -140) p = bez(cOut(ci), gIn(ci), ease((dt + 330) / 190));
+        else if (dt >= -140 && dt < 0) p = lin(gOutA, eInA, (dt + 140) / 140);
+        if (p) { if (isNew) dot(p, 4.2, col, C.ink); else dot(p, 3.2, C.panel, C.muted); }
+        if (dt >= 0 && dt < 170) dot(lin(eJ, jIn, dt / 170), 2.2, C.ink);      // into the journal
+      } else if (k === 3) {                           // fill: engine -> gateway -> the participant that traded
+        const ci = e[2] - 1;
+        let p = null;
+        if (dt >= 0 && dt < 140) p = lin(eOutB, gInB, dt / 140);
+        else if (dt >= 140 && dt < 340) p = bez(gIn(ci), cOut(ci), ease((dt - 140) / 200));
+        if (p) diamond(p, e[2] === 1 ? 5.5 : 4, e[2] === 1 ? C.maker : (e[7] === 0 ? C.bid : C.ask));
+      } else if (k === 5) {                           // trade print: engine -> feed -> listeners
+        let p = null;
+        if (dt >= 0 && dt < 220) p = lin(eF, fIn, dt / 220);
+        else if (dt >= 300 && dt < 420) p = lin([busX, FD.y + FD.h], [busX, LS[0].y], (dt - 300) / 120);
+        else if (dt >= 420 && dt < 500) p = lin([busX, LS[0].y + 40], [busX, LS[1].y], (dt - 420) / 80);
+        if (p) dot(p, 3.6, e[4] === 0 ? C.bid : C.ask, C.ink);
+      } else if (k === 1 || (k === 4 && e[5] !== 1)) { // book change: a small feed message
+        if (dt >= 0 && dt < 220) dot(lin(eF, fIn, dt / 220), 1.8, C.muted);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- chart and maker panel
+  const CH_ = { x: 26, y: 470, w: 826, h: 178 }, SPAN = 20000;
+  function drawChart(t) {
+    box({ x: CH_.x, y: CH_.y - 26, w: CH_.w, h: CH_.h + 52 });
+    txt("Price, last 20 seconds", CH_.x + 14, CH_.y - 6, "700 15px " + SERIF, C.ink);
+    const t0 = t - SPAN, x = tt => CH_.x + 44 + (tt - t0) / SPAN * (CH_.w - 60);
+    const a = Math.max(0, upto(Q, t0, 0)), b = upto(Q, t, 0);
+    if (b < 0) return;
+    let lo = 1e9, hi = -1e9;
+    for (let i = a; i <= b; i++) { lo = Math.min(lo, Q[i][2]); hi = Math.max(hi, Q[i][3]); }
+    lo = Math.floor((lo - 1) / 4) * 4; hi = Math.ceil((hi + 1) / 4) * 4;
+    const y = p => CH_.y + 12 + (hi - p) / (hi - lo) * (CH_.h - 16);
+    ctx.save(); ctx.beginPath(); ctx.rect(CH_.x + 1, CH_.y, CH_.w - 2, CH_.h + 20); ctx.clip();
+    for (let p = lo; p <= hi; p += 4) {
+      ctx.strokeStyle = C.grid; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(CH_.x + 44, y(p) + 0.5); ctx.lineTo(CH_.x + CH_.w - 14, y(p) + 0.5); ctx.stroke();
+      txt(String(p), CH_.x + 38, y(p) + 4, "11px " + SANS, C.muted, "right");
+    }
+    // maker's quoted band
+    ctx.beginPath();
+    for (let i = a; i <= b; i++) { const X = Math.max(x(Q[i][0]), CH_.x + 44); if (i === a) ctx.moveTo(X, y(Q[i][3])); else { ctx.lineTo(X, y(Q[i - 1][3])); ctx.lineTo(X, y(Q[i][3])); } }
+    ctx.lineTo(x(t), y(Q[b][3])); ctx.lineTo(x(t), y(Q[b][2]));
+    for (let i = b; i >= a; i--) { const X = Math.max(x(Q[i][0]), CH_.x + 44); ctx.lineTo(X, y(Q[i][2])); if (i > a) ctx.lineTo(X, y(Q[i - 1][2])); }
+    ctx.closePath(); ctx.fillStyle = C.makerSoft; ctx.fill(); ctx.strokeStyle = C.maker; ctx.lineWidth = 1.2; ctx.stroke();
+    // true value (the simulator knows it, the maker does not)
+    const va = Math.max(0, upto(V, t0, 0)), vb = upto(V, t, 0);
+    ctx.beginPath();
+    for (let i = va; i <= vb; i++) { const X = Math.max(x(V[i][0]), CH_.x + 44); if (i === va) ctx.moveTo(X, y(V[i][1])); else ctx.lineTo(X, y(V[i][1])); }
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 1.6; ctx.stroke();
+    // trades
+    for (let i = upto(EV, t, 1); i >= 0 && EV[i][1] >= t0; i--) {
+      const e = EV[i]; if (e[0] !== 5) continue;
+      const X = x(e[1]); if (X < CH_.x + 44) continue;
+      dot([X, y(e[2])], 2.2 + Math.min(4, Math.sqrt(e[3])), e[4] === 0 ? C.bid : C.ask, C.panel);
+    }
+    ctx.restore();
+    const ly = CH_.y + CH_.h + 17;
+    ctx.strokeStyle = C.ink; ctx.lineWidth = 1.6; ctx.beginPath(); ctx.moveTo(CH_.x + 44, ly - 4); ctx.lineTo(CH_.x + 64, ly - 4); ctx.stroke();
+    txt("true value, hidden from the maker", CH_.x + 70, ly, "12px " + SANS, C.muted);
+    ctx.fillStyle = C.makerSoft; ctx.fillRect(CH_.x + 290, ly - 10, 20, 11); ctx.strokeStyle = C.maker; ctx.strokeRect(CH_.x + 290.5, ly - 9.5, 20, 11);
+    txt("maker's bid and ask", CH_.x + 316, ly, "12px " + SANS, C.muted);
+    dot([CH_.x + 462, ly - 4], 4, C.bid, C.panel); txt("trade, buyer crossed", CH_.x + 472, ly, "12px " + SANS, C.muted);
+    dot([CH_.x + 622, ly - 4], 4, C.ask, C.panel); txt("trade, seller crossed", CH_.x + 632, ly, "12px " + SANS, C.muted);
+  }
+
+  const MP = { x: 880, y: 444, w: 294, h: 204 };
+  function drawMaker(t) {
+    box(MP);
+    ctx.fillStyle = C.maker; ctx.fillRect(MP.x, MP.y, 6, MP.h);
+    txt("Market maker", MP.x + 20, MP.y + 26, "700 16px " + SERIF, C.ink);
+    const b = upto(Q, t, 0); if (b < 0) return;
+    const q = Q[b], inv = q[4], pnl = q[5];
+    txt("profit so far, in ticks", MP.x + 20, MP.y + 50, "12px " + SANS, C.muted);
+    txt((pnl >= 0 ? "+" : "") + fmt(Math.round(pnl)), MP.x + 20, MP.y + 84, "700 32px " + SANS, C.ink);
+    // profit path for the whole run so far
+    const sx = MP.x + 150, sw = MP.w - 166, sy = MP.y + 50, sh = 38;
+    let lo = 0, hi = 1; for (let i = 0; i <= b; i++) { lo = Math.min(lo, Q[i][5]); hi = Math.max(hi, Q[i][5]); }
+    ctx.beginPath();
+    for (let i = 0; i <= b; i += 2) { const X = sx + Q[i][0] / DUR * sw, Y = sy + sh - (Q[i][5] - lo) / (hi - lo) * sh; if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); }
+    ctx.strokeStyle = C.maker; ctx.lineWidth = 2; ctx.stroke();
+    // inventory gauge
+    const gx = MP.x + 20, gw = MP.w - 40, gy = MP.y + 128, cap = 30;
+    txt("inventory", gx, gy - 10, "12px " + SANS, C.muted);
+    txt((inv > 0 ? "+" : "") + inv + " units", gx + gw, gy - 10, "600 13px " + SANS, C.ink, "right");
+    ctx.fillStyle = C.paper; ctx.fillRect(gx, gy, gw, 14); ctx.strokeStyle = C.line; ctx.lineWidth = 1; ctx.strokeRect(gx + 0.5, gy + 0.5, gw, 14);
+    const w = Math.max(-1, Math.min(1, inv / cap)) * gw / 2;
+    ctx.fillStyle = inv >= 0 ? C.bid : C.ask; ctx.fillRect(w >= 0 ? gx + gw / 2 : gx + gw / 2 + w, gy + 1, Math.abs(w), 12);
+    ctx.fillStyle = C.ink; ctx.fillRect(gx + gw / 2 - 0.5, gy - 3, 1, 20);
+    txt("short", gx, gy + 29, "11px " + SANS, C.muted); txt("long", gx + gw, gy + 29, "11px " + SANS, C.muted, "right");
+    txt(fmt(counts.trades) + " trades on the exchange, " + fmt(counts.volume) + " units", gx, MP.y + MP.h - 14, "12px " + SANS, C.muted);
+  }
+
+  function draw(t) {
+    advance(t);
+    drawPaper();
+    drawStatic(t);
+    drawEngine(t);
+    drawParticles(t);
+    drawChart(t);
+    drawMaker(t);
+  }
+
+  // ---------------------------------------------------------------- playback
+  const playBtn = document.getElementById("play"), speedSel = document.getElementById("speed");
+  const scrub = document.getElementById("scrub"), clock = document.getElementById("clock");
+  const START = 1500;  // skip the first moments while the book fills
+  let now = START, playing = !window.matchMedia("(prefers-reduced-motion: reduce)").matches, prev = null;
+  function setPlaying(p) { playing = p; playBtn.textContent = p ? "Pause" : "Play"; prev = null; }
+  setPlaying(playing);
+  function sync() { scrub.value = Math.round(now / DUR * 1000); clock.textContent = (now / 1000).toFixed(1) + " s"; }
+  function frame(ts) {
+    if (playing) {
+      if (prev !== null) now += (ts - prev) * parseFloat(speedSel.value);
+      prev = ts;
+      if (now >= DUR) now = START;
+      draw(now); sync();
+    }
+    requestAnimationFrame(frame);
+  }
+  playBtn.addEventListener("click", () => setPlaying(!playing));
+  scrub.addEventListener("input", () => { now = scrub.value / 1000 * DUR; draw(now); sync(); });
+  document.addEventListener("keydown", e => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); setPlaying(!playing); } });
+
+  // used by scripts/capture_gif.js to render exact frames
+  window.renderAt = ms => { setPlaying(false); now = ms; draw(now); sync(); };
+
+  const fontsReady = document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
+  fontsReady.then(() => { draw(now); sync(); requestAnimationFrame(frame); });
+})();
+</script>
+</body>
+</html>
